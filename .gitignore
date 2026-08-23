@@ -1,0 +1,11 @@
+# Rust build artifacts
+target/
+Cargo.lock.bak
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets & local env
+.env

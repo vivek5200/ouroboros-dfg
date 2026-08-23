@@ -4,10 +4,27 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust semantic verifier for Ouroboros v7.1 — DFG extraction and equality saturation"
 
+[lib]
+# rlib keeps `cargo test` / internal use working; cdylib is what maturin packages
+# into the Python wheel (ouroboros_dfg extension module). The lib target uses an
+# underscore because Python module names must not contain `-`.
+name = "ouroboros_dfg"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 egg = "0.9.5"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+pyo3 = { version = "0.29.2", optional = true }
+# Module 5 tree-sitter frontends (Python first). Versions are whatever cargo
+# resolves; the exact API calls are cited against the downloaded registry
+# sources in src/frontend_python.rs module docs.
+tree-sitter = "0.25"
+tree-sitter-python = "0.23"
 
 [dev-dependencies]
+
+[features]
+pyo3 = ["dep:pyo3"]
+pyo3-ext = ["dep:pyo3", "pyo3/extension-module"]
