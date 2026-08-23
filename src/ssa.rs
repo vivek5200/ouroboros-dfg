@@ -129,6 +129,18 @@ impl Ssa {
             && self.defs[v.0 as usize].is_none()
     }
 
+    /// Zero-based position of `v` in parameter DECLARATION order, or `None`
+    /// when `v` is not a declared parameter.
+    ///
+    /// Cross-graph egg lowering ([`crate::ssa_bridge::to_rec_expr`]) keys
+    /// parameter NAMES on this ordinal instead of the raw Value id: real
+    /// frontends interleave def and param allocation in evaluation order,
+    /// so raw ids for "the same input" diverge between two programs while
+    /// the input ORDER stays the stable source-level truth.
+    pub fn param_ordinal(&self, v: Value) -> Option<usize> {
+        self.params.iter().position(|&p| p == v)
+    }
+
     /// Values whose operation references `v`.
     pub fn uses(&self, v: Value) -> Vec<Value> {
         self.defs
@@ -283,5 +295,23 @@ mod tests {
         let v2 = g.add(a, a);
         assert_ne!(v1, v2, "every op mints a fresh Value");
         assert_eq!(g.uses(a).len(), 2);
+    }
+
+    /// Ordinals follow DECLARATION order, not raw Value ids: a def minted
+    /// between two params shifts every later param's id but not its ordinal.
+    /// (Contract relied on by the egg bridge's `p<N>` naming.)
+    #[test]
+    fn param_ordinal_is_declaration_order_not_value_id() {
+        let mut g = Ssa::new();
+        let a = g.new_param(); // Value(0), ordinal 0
+        let b = g.new_param(); // Value(1), ordinal 1
+        let t = g.add(a, b); // Value(2): a def interleaved!
+        let c = g.new_param(); // Value(3), ordinal 2
+        assert_eq!(g.param_ordinal(a), Some(0));
+        assert_eq!(g.param_ordinal(b), Some(1));
+        assert_eq!(g.param_ordinal(c), Some(2));
+        assert_eq!(g.param_ordinal(t), None);
+        // Unknown ids are None too.
+        assert_eq!(g.param_ordinal(Value(99)), None);
     }
 }

@@ -33,15 +33,20 @@
 
 use egg::{rewrite as rw, Rewrite, SymbolLang};
 
-/// Math rule system: AC-style addition plus the algebraic identities
-/// `x+0 => x` and `x*1 => x`.
+/// Math rule system: AC-style addition AND multiplication (commutativity for
+/// both; both associativity directions for addition) plus the algebraic
+/// identities `x+0 => x` and `x*1 => x`.
 ///
-/// Commutativity needs only ONE direction: child-swap is involutive, so
-/// `"(+ ?a ?b)" => "(+ ?b ?a)"` already realizes the full `<->` pair.
-/// Associativity genuinely requires both directions.
+/// Commutativity needs only ONE direction per operator: child-swap is
+/// involutive, so `"(+ ?a ?b)" => "(+ ?b ?a)"` already realizes the full
+/// `<->` pair (same for `*`). Associativity genuinely requires both
+/// directions. `commute-mul` was added for the Module 5 end-to-end Python
+/// proof ([`crate::e2e_proof`]): `a * b` vs `b * a` is a §7.2 identity and
+/// the SSA dialect must mirror it (see [`ssa_math_rules`] docs).
 pub fn math_rules() -> Vec<Rewrite<SymbolLang, ()>> {
     vec![
         rw!("commute-add"; "(+ ?a ?b)"          => "(+ ?b ?a)"),
+        rw!("commute-mul"; "(* ?a ?b)"          => "(* ?b ?a)"),
         rw!("assoc-add"; "(+ ?a (+ ?b ?c))"     => "(+ (+ ?a ?b) ?c)"),
         rw!("assoc-add-flip"; "(+ (+ ?a ?b) ?c)" => "(+ ?a (+ ?b ?c))"),
         // Algebraic simplifications (one-directional by design; see module docs).
@@ -93,13 +98,17 @@ pub fn all_rules() -> Vec<Rewrite<SymbolLang, ()>> {
 /// `SymbolLang` treats operators as opaque symbols (rules.rs module docs),
 /// so `(add p0 p1)` matches NOTHING in [`math_rules`] — its patterns spell
 /// the operator `+`. These twins carry the identical §7.2 identities
-/// (commutativity, both associativity directions, `x+0 => x`, `x*1 => x`)
-/// under the IR spelling. Same one-directionality choices as
-/// [`math_rules`]: child-swap realizes full commutativity; identities stay
-/// directed simplifications.
+/// (commutativity for BOTH `add` and `mul`, both associativity directions,
+/// `x+0 => x`, `x*1 => x`) under the IR spelling. Same one-directionality
+/// choices as [`math_rules`]: child-swap realizes full commutativity;
+/// identities stay directed simplifications. `ssa-commute-mul` exists so the
+/// end-to-end Python refactor proof ([`crate::e2e_proof`], case `commute`)
+/// can verify `a * b` ≡ `b * a`; without it the two muls sit in distinct
+/// e-classes forever.
 pub fn ssa_math_rules() -> Vec<Rewrite<SymbolLang, ()>> {
     vec![
         rw!("ssa-commute-add"; "(add ?a ?b)"            => "(add ?b ?a)"),
+        rw!("ssa-commute-mul"; "(mul ?a ?b)"            => "(mul ?b ?a)"),
         rw!("ssa-assoc-add"; "(add ?a (add ?b ?c))"     => "(add (add ?a ?b) ?c)"),
         rw!("ssa-assoc-add-flip"; "(add (add ?a ?b) ?c)" => "(add ?a (add ?b ?c))"),
         // Algebraic simplifications over emitted integer literals.
@@ -144,10 +153,11 @@ mod tests {
     #[test]
     fn math_rules_carry_algebraic_identities() {
         let rules = math_rules();
-        assert_eq!(rules.len(), 5);
+        assert_eq!(rules.len(), 6);
         let names: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"add-zero"), "{names:?}");
         assert!(names.contains(&"mul-one"), "{names:?}");
+        assert!(names.contains(&"commute-mul"), "{names:?}");
     }
 
     #[test]
@@ -155,15 +165,17 @@ mod tests {
         assert_eq!(all_rules().len(), math_rules().len() + boolean_rules().len());
     }
 
-    /// The SSA dialect mirrors the math system rule-for-rule (5 rewrites:
-    /// commute + both assoc directions + two directed identities).
+    /// The SSA dialect mirrors the math system rule-for-rule (6 rewrites:
+    /// commutativity for add AND mul + both assoc directions + two directed
+    /// identities).
     #[test]
     fn ssa_math_rules_mirror_math_rules() {
         let rules = ssa_math_rules();
-        assert_eq!(rules.len(), 5);
+        assert_eq!(rules.len(), 6);
         let names: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
         for expected in [
             "ssa-commute-add",
+            "ssa-commute-mul",
             "ssa-assoc-add",
             "ssa-assoc-add-flip",
             "ssa-add-zero",

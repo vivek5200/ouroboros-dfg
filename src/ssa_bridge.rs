@@ -11,10 +11,17 @@
 //! EMISSION CONTRACT:
 //! - op spellings: `add` / `mul` / `neg`, each def renders as
 //!   `(op arg1 arg2 ...)`;
-//! - parameters render as `p<N>` where `N` is the parameter's **Value id**
-//!   (`p0..pN` per graph) — ids are dense and graph-local by construction,
-//!   so two graphs with different param counts never cross-contaminate
-//!   names (each conversion starts from its own `Ssa`);
+//! - parameters render as `p<N>` where `N` is the parameter's **declaration
+//!   ordinal** ([`Ssa::param_ordinal`], i.e. "i-th declared input"), NOT its
+//!   raw Value id. RATIONALE (found by the Module 5 end-to-end Python proof,
+//!   [`crate::e2e_proof`]): frontends mint defs and params interleaved in
+//!   evaluation order, so `r = (a + b) + c` allocates c's Value id AFTER the
+//!   intermediate add (`p3`) while `r = a + (b + c)` allocates it before
+//!   (`p2`). Id-keyed names would leave the same input spelled differently
+//!   on each side and NO refactoring could ever cross-merge. Ordinals are
+//!   dense, graph-local, and equal on both sides whenever the programs read
+//!   the same number of inputs in the same order; graphs with different
+//!   arities still never cross-contaminate names;
 //! - constants render as bare integer literals (`0`, `7`, `-3`) — this is
 //!   what lets the algebraic identities in [`crate::rules::ssa_math_rules`]
 //!   (`(add ?a 0)` => `?a`) match emitted graphs;
@@ -93,8 +100,11 @@ fn render(
     }
     let text = if ssa.is_param(v) {
         // is_param is bounds-checked (ssa.rs), so params are distinguished
-        // from dangling ids before the match below.
-        format!("p{}", v.0)
+        // from dangling ids before the match below. Names key on the
+        // declaration ordinal (see EMISSION CONTRACT): `is_param` ⇒ the
+        // value IS in `params`, so the ordinal lookup cannot miss — the
+        // fallback to the raw id only guards an internal-invariant break.
+        format!("p{}", ssa.param_ordinal(v).unwrap_or(v.0 as usize))
     } else {
         match ssa.op_of(v) {
             Some(Op::Const(c)) => c.to_string(),
@@ -186,6 +196,42 @@ mod tests {
         let r = three.new_param();
         let s = three.add(r, r);
         assert_eq!(to_rec_expr(&three, s).to_string(), "(add p2 p2)");
+    }
+
+    /// REGRESSION (found by the Module 5 end-to-end Python proof): a param
+    /// minted AFTER defs must still render with its dense DECLARATION
+    /// ORDINAL. Here %0=a %1=b %2=(a+b) def %3=c ⇒ c is `p2`, NOT `p3`.
+    #[test]
+    fn params_interleaved_with_defs_name_by_ordinal() {
+        let mut g = Ssa::new();
+        let a = g.new_param();
+        let b = g.new_param();
+        let t = g.add(a, b);
+        let c = g.new_param(); // Value id 3, but third declared input
+        let out = g.add(t, c);
+        assert_eq!(to_rec_expr(&g, out).to_string(), "(add (add p0 p1) p2)");
+    }
+
+    /// Cross-graph name stability — the exact shape pair behind the
+    /// associativity source refactor: both programs read the SAME three
+    /// inputs in the same order, only the evaluation tree differs, so every
+    /// input keeps its name on both sides and the rewrite can merge them.
+    #[test]
+    fn same_inputs_across_evaluation_shapes_render_matching_names() {
+        // Left: `(a + b) + c` — c's Value id lands AFTER the intermediate def.
+        let mut left = Ssa::new();
+        let (a0, b0) = (left.new_param(), left.new_param());
+        let t = left.add(a0, b0);
+        let c0 = left.new_param();
+        let lout = left.add(t, c0);
+        // Right: `a + (b + c)` — all params first, then defs.
+        let mut right = Ssa::new();
+        let (a1, b1, c1) = (right.new_param(), right.new_param(), right.new_param());
+        let u = right.add(b1, c1);
+        let rout = right.add(a1, u);
+
+        assert_eq!(to_rec_expr(&left, lout).to_string(), "(add (add p0 p1) p2)");
+        assert_eq!(to_rec_expr(&right, rout).to_string(), "(add p0 (add p1 p2))");
     }
 
     /// Dangling operand: converts to an inert `undef<N>` atom (no panic),

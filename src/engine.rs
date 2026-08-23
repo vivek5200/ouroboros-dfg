@@ -534,7 +534,7 @@ mod tests {
     }
 
     /// Param naming collision safety: graphs with different param counts
-    /// still convert (`p0..pN` minted PER GRAPH from Value ids). Two roots
+    /// still convert (`p0..pN` keyed on per-graph declaration ordinals). Two roots
     /// that merely share an index but not structure stay Unproven instead of
     /// accidentally merging on names.
     #[test]

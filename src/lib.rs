@@ -16,6 +16,9 @@
 pub mod pyo3_ext;
 
 pub mod async_engine;
+/// End-to-end proof harness: Python source text → SSA → egg → Verdict
+/// ([`e2e_proof::prove_refactor`]), composing frontend, bridge and engine.
+pub mod e2e_proof;
 /// Module 5 Python frontend: tree-sitter lowering of a constrained but real
 /// subset (integer arithmetic + assignment) into [`crate::ssa`].
 pub mod frontend_python;
