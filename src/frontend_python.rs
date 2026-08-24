@@ -1,11 +1,17 @@
 //! Module 5 Python frontend: lowers a constrained but REAL subset of Python
 //! source into the SSA IR ([`crate::ssa`]) using tree-sitter.
 //!
-//! SUPPORTED SUBSET (everything else is a [`LoweringError`] saying
-//! "unsupported"):
+//! SUPPORTED SUBSET (everything else is a [`LoweringError`] embedding the
+//! same summary verbatim — see [`supported_constructs`]):
 //! - integer literals (including `1_000` digit separators) → [`Op::Const`]
 //! - `name = expr` assignment; REBINDING MINTS A FRESH VALUE (SSA): the old
 //!   binding stays live in the graph while the env moves to the new value
+//! - augmented assignments `name += e` / `name -= e` / `name *= e`,
+//!   desugared with the SAME SSA-rebinding discipline as plain `=`:
+//!   `x += e` ≡ `x = x + e`; `x -= e` ≡ `add(x, neg(e))` (no Sub opcode);
+//!   `x *= e` ≡ `x = x * e`. The RHS is evaluated against the UNCHANGED
+//!   env, so `y *= y` reads the old binding on both sides; later reads see
+//!   the newest binding.
 //! - binary `+` / `*` → [`Op::Add`] / [`Op::Mul`]; binary `-` desugars
 //!   exactly to `add(lhs, neg(rhs))` because the IR has no Sub opcode
 //! - unary `-` → [`Op::Neg`] (unary `+` is the identity)
@@ -18,12 +24,14 @@
 //! [`Ssa::new_param`] — the first occurrence mints the parameter, later
 //! occurrences reuse that same Value. A name already bound by an earlier
 //! assignment is NOT a parameter (its current binding is used instead).
+//! The same policy applies to the read side of an augmented assignment on
+//! an unseen name (`x += 1` alone mints x as a parameter).
 //!
-//! STRICTNESS NOTES: comments, strings, floats, augmented/chained
-//! assignment, defs/classes/if/while/etc. are all rejected with an
-//! "unsupported construct `<kind>`" message rather than silently dropped;
-//! any tree-sitter parse error (ERROR/MISSING node) is rejected upfront as
-//! a syntax error.
+//! STRICTNESS NOTES: comments, strings, floats, chained assignment and any
+//! augmented operator outside `+= -= *=` are rejected with an
+//! "unsupported construct" message that embeds [`supported_constructs`]
+//! verbatim plus the offending kind; any tree-sitter parse error
+//! (ERROR/MISSING node) is rejected upfront as a syntax error.
 //!
 //! TREE-SITTER API SOURCES (verified against downloaded crate sources,
 //! versions resolved by cargo — these APIs changed across 0.20→0.25):
@@ -75,6 +83,35 @@ impl std::error::Error for LoweringError {}
 
 fn err(message: impl Into<String>) -> LoweringError {
     LoweringError { message: message.into() }
+}
+
+/// The supported Python subset, as one verbatim summary string.
+///
+/// Every "unsupported construct" [`LoweringError`] embeds this exact text
+/// (`…; supported: <this>; got `<kind>``) so callers can self-serve by
+/// substring-matching [`LoweringError::message`] against this function's
+/// return value.
+pub fn supported_constructs() -> &'static str {
+    "int literals, names, = and augmented += -= *=, binary + - *, unary -, \
+     parentheses"
+}
+
+/// Unsupported tree-sitter node kind: names the kind and lists the whole
+/// supported subset (see [`supported_constructs`]) so callers self-serve.
+fn unsupported_construct(kind: impl fmt::Display) -> LoweringError {
+    err(format!(
+        "unsupported construct `{kind}`; supported: {}; got `{kind}`",
+        supported_constructs()
+    ))
+}
+
+/// Unsupported operator token (`/`, `//`, `**`, `~`, `%=` …): names the
+/// operator role and lists the whole supported subset.
+fn unsupported_operator(label: &str, op: impl fmt::Display) -> LoweringError {
+    err(format!(
+        "unsupported {label} operator `{op}`; supported: {}; got `{op}`",
+        supported_constructs()
+    ))
 }
 
 /// Result of lowering a whole module: the accumulated SSA graph plus the
@@ -156,10 +193,12 @@ pub fn lower_module(source: &str) -> Result<Lowered, LoweringError> {
                         handle_assignment(&mut ssa, inner, &mut env, bytes)?;
                     }
                     "augmented_assignment" => {
-                        return Err(err(
-                            "unsupported construct: augmented assignment \
-                             (`+=` etc.; supported: plain `=` only)",
-                        ));
+                        handle_augmented_assignment(
+                            &mut ssa,
+                            inner,
+                            &mut env,
+                            bytes,
+                        )?;
                     }
                     _ => {
                         let v = lower_expr(&mut ssa, inner, &mut env, bytes)?;
@@ -172,11 +211,11 @@ pub fn lower_module(source: &str) -> Result<Lowered, LoweringError> {
             "assignment" => {
                 handle_assignment(&mut ssa, stmt, &mut env, bytes)?;
             }
+            "augmented_assignment" => {
+                handle_augmented_assignment(&mut ssa, stmt, &mut env, bytes)?;
+            }
             other => {
-                return Err(err(format!(
-                    "unsupported construct `{other}` (supported: assignments, \
-                     integer arithmetic with + - *, unary minus, parentheses)"
-                )))
+                return Err(unsupported_construct(other));
             }
         }
     }
@@ -205,8 +244,8 @@ fn handle_assignment(
     }
     // Chained `a = b = …` nests another assignment on the right.
     if matches!(right.kind(), "assignment" | "augmented_assignment") {
-        return Err(err(format!(
-            "unsupported construct: chained/augmented assignment (`{}`)",
+        return Err(unsupported_construct(format!(
+            "chained {}",
             right.kind()
         )));
     }
@@ -215,6 +254,76 @@ fn handle_assignment(
     // SSA discipline: evaluate the RHS against the OLD env FIRST, then move
     // the binding to the freshly minted Value.
     let v = lower_expr(ssa, right, env, bytes)?;
+    env.insert(name.to_string(), v);
+    Ok(())
+}
+
+/// Lower one `name <op>= expr` augmented assignment node (SSA rebinding,
+/// exactly like [`handle_assignment`]).
+///
+/// Desugar (the IR has no Sub opcode):
+/// - `x += e` → `add(x_old, e)`
+/// - `x -= e` → `add(x_old, neg(e))`
+/// - `x *= e` → `mul(x_old, e)`
+///
+/// SSA discipline: the OLD binding of `x` is read first (an unseen name
+/// mints a parameter per the NAME POLICY), then the RHS is evaluated
+/// against the UNCHANGED env — so `y *= y` reads the old y on both sides —
+/// and the combination is a FRESH Value rebound to `x`. Later references
+/// resolve through the env to that newest binding.
+fn handle_augmented_assignment(
+    ssa: &mut Ssa,
+    node: Node<'_>,
+    env: &mut HashMap<String, Value>,
+    bytes: &[u8],
+) -> Result<(), LoweringError> {
+    let left = node
+        .child_by_field_name("left")
+        .ok_or_else(|| err("malformed augmented_assignment: missing `left`"))?;
+    let op = node.child_by_field_name("operator").ok_or_else(|| {
+        err("malformed augmented_assignment: missing `operator`")
+    })?;
+    let right = node.child_by_field_name("right").ok_or_else(|| {
+        err("malformed augmented_assignment: missing `right`")
+    })?;
+    if left.kind() != "identifier" {
+        return Err(err(format!(
+            "unsupported augmented assignment target `{}` (only plain names)",
+            left.kind()
+        )));
+    }
+    // Reject unsupported augmented operators BEFORE touching the graph so
+    // failures mint nothing.
+    match op.kind() {
+        "+=" | "-=" | "*=" => {}
+        other => {
+            return Err(unsupported_operator("augmented assignment", other));
+        }
+    }
+    let name =
+        left.utf8_text(bytes).map_err(|e| err(format!("invalid identifier encoding: {e}")))?;
+    // Read the OLD binding first; unseen ⇒ parameter (NAME POLICY).
+    let old = match env.get(name) {
+        Some(v) => *v,
+        None => {
+            let p = ssa.new_param();
+            env.insert(name.to_string(), p);
+            p
+        }
+    };
+    // RHS sees the unchanged env (old bindings everywhere).
+    let rhs = lower_expr(ssa, right, env, bytes)?;
+    // Combine onto a FRESH SSA value, then rebind the name to it.
+    let v = match op.kind() {
+        "+=" => ssa.add(old, rhs),
+        // No Sub opcode in the IR: `a -= b` ≡ add(a, neg(b)).
+        "-=" => {
+            let nr = ssa.neg(rhs);
+            ssa.add(old, nr)
+        }
+        "*=" => ssa.mul(old, rhs),
+        _ => unreachable!("operator validated above"),
+    };
     env.insert(name.to_string(), v);
     Ok(())
 }
@@ -278,9 +387,7 @@ fn lower_expr<'t>(
                     Ok(ssa.add(l, nr))
                 }
                 "*" => Ok(ssa.mul(l, r)),
-                other => Err(err(format!(
-                    "unsupported binary operator `{other}` (supported: + - *)"
-                ))),
+                other => Err(unsupported_operator("binary", other)),
             }
         }
         "unary_operator" => {
@@ -294,15 +401,10 @@ fn lower_expr<'t>(
             match op.kind() {
                 "-" => Ok(ssa.neg(a)),
                 "+" => Ok(a),
-                other => Err(err(format!(
-                    "unsupported unary operator `{other}` (supported: -)"
-                ))),
+                other => Err(unsupported_operator("unary", other)),
             }
         }
-        other => Err(err(format!(
-            "unsupported construct `{other}` in expression position \
-             (supported: integers, names, parentheses, + - *, unary -)"
-        ))),
+        other => Err(unsupported_construct(other)),
     }
 }
 
@@ -453,13 +555,14 @@ mod tests {
         assert_eq!(l.ssa.op_of(n), Some(&Op::Const(1000)));
     }
 
-    /// Strings, floats, augmented and chained assignment all fail loudly.
+    /// Strings, floats, chained assignment and control flow all fail
+    /// loudly. (frontend v2: plain `x += 2` MOVED OUT of this list —
+    /// augmented `+= -= *=` are now supported; see the v2 tests below.)
     #[test]
     fn unsupported_expressions_fail_loudly() {
         for src in [
             "s = \"hello\"",
             "f = 1.5",
-            "x = 1\nx += 2",
             "a = b = 1",
             "if x:\n  pass",
             "import os",
@@ -493,5 +596,140 @@ mod tests {
         assert_eq!(g.validate(), Ok(()));
         let w = l.value_of("w").unwrap();
         assert_eq!(g.evaluate(w, &[]).unwrap(), 14);
+    }
+
+    // ---- frontend v2: augmented assignments + self-serve errors ----
+
+    /// Required v2 test: `x = 1; x += 2` → final x == 3 via ssa.evaluate.
+    /// `+=` mints a FRESH SSA Value rebound to `x` — SSA rebinding exactly
+    /// like plain reassign; the old binding stays live in the graph.
+    #[test]
+    fn augmented_add_rebinds_fresh_value() {
+        let l = lower_module("x = 1\nx += 2").unwrap();
+        l.ssa.validate().unwrap();
+        // Deterministic build order: %0 = const 1 (first x), %1 = const 2
+        // (rhs literal), %2 = add %0 %1 (rebound x).
+        let x0 = Value(0);
+        assert_eq!(l.ssa.op_of(x0), Some(&Op::Const(1)));
+        let x1 = l.value_of("x").expect("+= binds x");
+        assert_ne!(x1, x0, "+= must mint a fresh Value, not mutate");
+        assert_eq!(l.ssa.op_of(x1), Some(&Op::Add(x0, Value(1))));
+        assert_eq!(l.ssa.evaluate(x1, &[]).unwrap(), 3);
+        // The OLD binding survives untouched in the graph.
+        assert_eq!(l.ssa.evaluate(x0, &[]).unwrap(), 1);
+    }
+
+    /// Required v2 test: aliased `y *= y` reads the OLD binding on BOTH
+    /// sides (the rhs is evaluated against the unchanged env) → 2 * 2 == 4.
+    #[test]
+    fn augmented_mul_alias_reads_old_binding_both_sides() {
+        let l = lower_module("x = 2\ny = x\ny *= y").unwrap();
+        l.ssa.validate().unwrap();
+        let y = l.value_of("y").expect("y bound");
+        assert_eq!(l.ssa.evaluate(y, &[]).unwrap(), 4);
+        match l.ssa.op_of(y) {
+            Some(Op::Mul(a, b)) => {
+                assert_eq!(*a, *b, "both operands are the old y");
+            }
+            other => panic!("expected mul, got {other:?}"),
+        }
+    }
+
+    /// Required v2 test: `x = 5; x -= 2; x *= 3` → 9. `-=` desugars exactly
+    /// to add(x, neg(e)) because the IR has no Sub opcode.
+    #[test]
+    fn augmented_sub_then_mul_chain_evaluates() {
+        let l = lower_module("x = 5\nx -= 2\nx *= 3").unwrap();
+        l.ssa.validate().unwrap();
+        // Build order: %0=c5, %1=c2, %2=neg %1, %3=add %0 %2 (after -=),
+        // then %4=c3, %5=mul %3 %4 (after *=).
+        assert_eq!(
+            l.ssa.op_of(Value(3)),
+            Some(&Op::Add(Value(0), Value(2))),
+            "-= must desugar to add(x, neg(e))"
+        );
+        assert_eq!(l.ssa.op_of(Value(2)), Some(&Op::Neg(Value(1))));
+        let x = l.value_of("x").unwrap();
+        assert_eq!(l.ssa.evaluate(x, &[]).unwrap(), 9);
+    }
+
+    /// Chained later references use the NEWEST binding produced by `+=`.
+    #[test]
+    fn augmented_newest_binding_feeds_later_reads() {
+        let l = lower_module("x = 1\nx += 2\nz = x * 10").unwrap();
+        l.ssa.validate().unwrap();
+        let z = l.value_of("z").unwrap();
+        assert_eq!(l.ssa.evaluate(z, &[]).unwrap(), 30);
+    }
+
+    /// `+=` on an UNSEEN name: the read side mints a parameter first
+    /// (NAME POLICY), then add(param, 1) is rebound to the name.
+    #[test]
+    fn augmented_on_unseen_name_mints_param_first() {
+        let l = lower_module("x += 1").unwrap();
+        l.ssa.validate().unwrap();
+        let x = l.value_of("x").unwrap();
+        match l.ssa.op_of(x) {
+            Some(Op::Add(p, c)) => {
+                assert!(l.ssa.is_param(*p), "read of unseen x is a param");
+                assert_eq!(l.ssa.op_of(*c), Some(&Op::Const(1)));
+            }
+            other => panic!("expected add(param, 1), got {other:?}"),
+        }
+        assert_eq!(l.ssa.evaluate(x, &[41]).unwrap(), 42);
+    }
+
+    /// Augmented operators outside {`+=`, `-=`, `*=`} stay rejected, and
+    /// the error still lists the supported subset verbatim.
+    #[test]
+    fn augmented_other_operators_stay_rejected() {
+        for src in ["x /= 2", "x **= 2", "x %= 3"] {
+            let e = lower(src).unwrap_err();
+            assert!(e.message.contains("unsupported"), "{src:?} → {e}");
+            assert!(
+                e.message.contains(supported_constructs()),
+                "{src:?} → missing subset: {e}"
+            );
+        }
+    }
+
+    /// Required v2 test: unsupported-construct errors LIST the supported
+    /// subset verbatim ([`supported_constructs()`]) AND name the offending
+    /// kind, so callers can self-serve from [`LoweringError::message`].
+    #[test]
+    fn unsupported_error_lists_subset_and_offending_kind() {
+        for (src, kind) in [
+            ("import os", "import_statement"),
+            ("f = 1.5", "float"),
+            ("s = \"hi\"", "string"),
+            ("if x:\n  pass", "if_statement"),
+            ("def f():\n  pass", "function_definition"),
+            ("x = 1 // 2", "//"),
+            ("x = ~y", "~"),
+        ] {
+            let e = lower(src).unwrap_err();
+            assert!(
+                e.message.contains(supported_constructs()),
+                "{src:?} → missing supported-subset string: {e}"
+            );
+            assert!(
+                e.message.contains(kind),
+                "{src:?} → missing offending kind `{kind}`: {e}"
+            );
+            assert!(e.message.contains("unsupported"), "{src:?} → {e}");
+        }
+    }
+
+    /// [`supported_constructs()`] returns the exact summary embedded in
+    /// every unsupported-construct error message.
+    #[test]
+    fn supported_constructs_is_the_error_embedded_summary() {
+        assert_eq!(
+            supported_constructs(),
+            "int literals, names, = and augmented += -= *=, binary + - *, \
+             unary -, parentheses"
+        );
+        let e = lower("import os").unwrap_err();
+        assert!(e.message.contains(supported_constructs()));
     }
 }
