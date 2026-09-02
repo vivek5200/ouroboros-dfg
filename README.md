@@ -1,5 +1,7 @@
 # Ouroboros DFG
 
+![tests](https://github.com/vivek5200/ouroboros-dfg/actions/workflows/tests.yml/badge.svg)
+
 Rust semantic verifier for the Ouroboros v7.1 code refactoring system.
 
 ## Module 5: DFG Verification
